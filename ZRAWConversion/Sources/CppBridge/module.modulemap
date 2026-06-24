@@ -1,0 +1,4 @@
+framework module CppBridge {
+    umbrella header "include/CppBridge.h"
+    export *
+}

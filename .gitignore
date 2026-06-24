@@ -6,3 +6,14 @@
 /*.raw
 /*.bin
 /.vscode
+
+# Swift / Xcode / macOS
+.build/
+DerivedData/
+xcuserdata/
+*.xcworkspace
+.DS_Store
+*.app
+*.app/
+Zraw2DNG.app
+ZRAWConversion-backup-before-ccm/

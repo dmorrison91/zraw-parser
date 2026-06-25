@@ -230,21 +230,19 @@ func zrawDebayerToRGB(cfaPixels: [UInt16], width: Int, height: Int, bitsPerPixel
 
 func zrawApplyColorPipeline(rgb: inout [Float], width: Int, height: Int,
                              awbGainR: UInt32, awbGainG: UInt32, awbGainB: UInt32,
-                             ccm: [Int32]?, applyLogC3: Bool) throws {
+                             ccm: [Int32]?) throws {
     let hasCCM = (ccm != nil) ? 1 : 0
     let ret = rgb.withUnsafeMutableBufferPointer { buf in
         if let ccm = ccm {
             return ccm.withUnsafeBufferPointer { ccmBuf in
                 zraw_apply_color_pipeline(buf.baseAddress, Int32(width), Int32(height),
                                            awbGainR, awbGainG, awbGainB,
-                                           ccmBuf.baseAddress, Int32(hasCCM),
-                                           applyLogC3 ? 1 : 0)
+                                           ccmBuf.baseAddress, Int32(hasCCM))
             }
         } else {
             return zraw_apply_color_pipeline(buf.baseAddress, Int32(width), Int32(height),
                                                awbGainR, awbGainG, awbGainB,
-                                               nil, Int32(hasCCM),
-                                               applyLogC3 ? 1 : 0)
+                                               nil, Int32(hasCCM))
         }
     }
     guard ret == 0 else {

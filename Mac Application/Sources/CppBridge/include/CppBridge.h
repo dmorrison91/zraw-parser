@@ -83,12 +83,11 @@ int zraw_process_frame(const uint8_t* frame_data, int size,
 int zraw_debayer_to_rgb(const uint16_t* cfa_pixels, int width, int height,
                          int bits_per_pixel, float* rgb_output);
 
-// Apply white balance + color matrix + optional ARRI LogC3 encoding to RGB float
+// Apply white balance + color matrix to RGB float
 // rgb is modified in-place (width * height * 3 floats)
 int zraw_apply_color_pipeline(float* rgb, int width, int height,
                                uint32_t awb_gain_r, uint32_t awb_gain_g, uint32_t awb_gain_b,
-                               const int32_t* ccm, int has_ccm,
-                               int apply_logc3);
+                               const int32_t* ccm, int has_ccm);
 
 // Set error message (thread-safe)
 void zraw_set_error(const char* msg);

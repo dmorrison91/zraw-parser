@@ -698,17 +698,9 @@ int zraw_debayer_to_rgb(const uint16_t* cfa_pixels, int width, int height,
 
 #pragma mark - Color Pipeline
 
-// ARRI LogC3 encoding curve
-static inline float logc3_encode(float x) {
-    if (x < 0.0f) return 0.0f;
-    if (x < 0.0003f) return 5.0f * x + 0.045f;
-    return 0.247190f * log10f(24.7920f * x + 1.0f) + 0.385537f;
-}
-
 int zraw_apply_color_pipeline(float* rgb, int width, int height,
                                uint32_t awb_gain_r, uint32_t awb_gain_g, uint32_t awb_gain_b,
-                               const int32_t* ccm, int has_ccm,
-                               int apply_logc3) {
+                               const int32_t* ccm, int has_ccm) {
     if (!rgb || width < 1 || height < 1) {
         SET_ERROR("Invalid color pipeline parameters");
         return -1;
@@ -729,7 +721,7 @@ int zraw_apply_color_pipeline(float* rgb, int width, int height,
             }
         }
 
-        // XYZ to ARRI Wide Gamut matrix (computed from AWG primaries + D65)
+        // XYZ to Wide Gamut matrix (computed from AWG primaries + D65)
         float xyz_to_awg[9] = {
             2.094f, -0.591f, -0.353f,
             -0.829f, 1.765f, 0.024f,
@@ -770,11 +762,6 @@ int zraw_apply_color_pipeline(float* rgb, int width, int height,
             g = g < 0 ? 0 : (g > 1 ? 1 : g);
             b = b < 0 ? 0 : (b > 1 ? 1 : b);
 
-            if (apply_logc3) {
-                r = logc3_encode(r);
-                g = logc3_encode(g);
-                b = logc3_encode(b);
-            }
 
             rgb[i * 3] = r;
             rgb[i * 3 + 1] = g;

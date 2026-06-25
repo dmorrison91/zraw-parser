@@ -39,9 +39,9 @@ PLIST="<?xml version=\"1.0\" encoding=\"UTF-8\"?>
     <key>CFBundleName</key>
     <string>Zraw2DNG</string>
     <key>CFBundleVersion</key>
-    <string>1.0</string>
+    <string>1.0.1</string>
     <key>CFBundleShortVersionString</key>
-    <string>1.0</string>
+    <string>1.0.1</string>
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>LSMinimumSystemVersion</key>
@@ -53,5 +53,9 @@ PLIST="<?xml version=\"1.0\" encoding=\"UTF-8\"?>
 </dict>
 </plist>"
 echo "$PLIST" > "$BUNDLE_DIR/Contents/Info.plist"
+
+# Strip quarantine/Spotlight extended attributes and ad-hoc sign the bundle
+xattr -cr "$BUNDLE_DIR"
+codesign --force --deep --sign - "$BUNDLE_DIR"
 
 echo "Created: $BUNDLE_DIR"

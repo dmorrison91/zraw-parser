@@ -53,6 +53,19 @@ Click "Cancel" to stop. Partially processed files are marked as cancelled; alrea
 
 Toggle the Log panel at the bottom of the window to view console output. Use "Copy All" to copy the log to the clipboard or "Clear" to reset.
 
+
+
+
+
+
+
+
+
+
+
+
+
+
 ### As a library
 
 Link against `libzraw.a` and include the C API headers:

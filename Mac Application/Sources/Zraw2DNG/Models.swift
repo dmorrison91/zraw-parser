@@ -74,6 +74,7 @@ enum CameraModelOverride: String, CaseIterable, Identifiable, Sendable {
     case ursa46 = "Blackmagic URSA 4.6K"
     case varicam = "Panasonic Varicam RAW"
     case dji = "DJI FC4280"
+    case canikon = "Canikon"
 
     var id: String { rawValue }
 

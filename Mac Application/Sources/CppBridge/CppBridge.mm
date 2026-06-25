@@ -20,6 +20,7 @@
 
 #include <mutex>
 static std::mutex s_errMutex;
+static std::mutex g_zraw_mutex;
 static std::string s_lastError;
 
 #define SET_ERROR(msg) do { \
@@ -251,6 +252,7 @@ void zraw_free_mov_info(ZRAWMovInfo_C* info) {
 int zraw_parse_frame(const uint8_t* frame_data, int size, ZRAWFrameInfo_C* info) {
     memset(info, 0, sizeof(*info));
 
+    std::lock_guard<std::mutex> lock(g_zraw_mutex);
     auto decoder = zraw_decoder__create();
     if (!decoder) {
         SET_ERROR("Failed to create ZRAW decoder");
@@ -291,6 +293,7 @@ int zraw_parse_frame(const uint8_t* frame_data, int size, ZRAWFrameInfo_C* info)
 int zraw_decompress_frame(const uint8_t* frame_data, int size,
                           uint16_t* pixels, int pixel_count)
 {
+    std::lock_guard<std::mutex> lock(g_zraw_mutex);
     auto decoder = zraw_decoder__create();
     if (!decoder) {
         SET_ERROR("Failed to create ZRAW decoder");
@@ -519,40 +522,44 @@ int zraw_process_frame(const uint8_t* frame_data, int size,
                        const char* reel_name)
 {
     try {
-        auto decoder = zraw_decoder__create();
-        if (!decoder) {
-            SET_ERROR("Failed to create ZRAW decoder");
-            return -1;
-        }
-
-        auto st = zraw_decoder__read_hisi_frame(decoder, (void*)frame_data, size);
-        if (st != ZRAW_DECODER_STATE__FRAME_IS_READ) {
-            SET_ERROR("Failed to read ZRAW frame");
-            zraw_decoder__free(decoder);
-            return -1;
-        }
-
-        st = zraw_decoder__decompress_hisi_frame(decoder);
-        if (st != ZRAW_DECODER_STATE__FRAME_IS_DECOMPRESSED) {
-            const char* msg = zraw_decoder__exception_message();
-            SET_ERROR(msg ? msg : "Failed to decompress ZRAW frame");
-            zraw_decoder__free(decoder);
-            return -1;
-        }
-
         uint32_t w = frame_info->width;
         uint32_t h = frame_info->height;
         uint32_t bits = frame_info->bits_per_pixel;
         int pixel_count = (int)(w * h);
 
         std::vector<uint16_t> image_data(pixel_count);
-        auto cfa_state = zraw_decoder__get_decompressed_CFA(decoder, image_data.data(), (int)(image_data.size() * sizeof(uint16_t)));
-        if (cfa_state != ZRAW_DECODER_STATE__STANDBY) {
-            SET_ERROR("Failed to get decompressed CFA");
+
+        {
+            std::lock_guard<std::mutex> lock(g_zraw_mutex);
+            auto decoder = zraw_decoder__create();
+            if (!decoder) {
+                SET_ERROR("Failed to create ZRAW decoder");
+                return -1;
+            }
+
+            auto st = zraw_decoder__read_hisi_frame(decoder, (void*)frame_data, size);
+            if (st != ZRAW_DECODER_STATE__FRAME_IS_READ) {
+                SET_ERROR("Failed to read ZRAW frame");
+                zraw_decoder__free(decoder);
+                return -1;
+            }
+
+            st = zraw_decoder__decompress_hisi_frame(decoder);
+            if (st != ZRAW_DECODER_STATE__FRAME_IS_DECOMPRESSED) {
+                const char* msg = zraw_decoder__exception_message();
+                SET_ERROR(msg ? msg : "Failed to decompress ZRAW frame");
+                zraw_decoder__free(decoder);
+                return -1;
+            }
+
+            auto cfa_state = zraw_decoder__get_decompressed_CFA(decoder, image_data.data(), (int)(image_data.size() * sizeof(uint16_t)));
+            if (cfa_state != ZRAW_DECODER_STATE__STANDBY) {
+                SET_ERROR("Failed to get decompressed CFA");
+                zraw_decoder__free(decoder);
+                return -1;
+            }
             zraw_decoder__free(decoder);
-            return -1;
         }
-        zraw_decoder__free(decoder);
 
         fprintf(stderr, "[zraw] process_frame timecode: has=%d %02d:%02d:%02d:%02d @ %d fps, framerate=%d/%d\n",
                 has_timecode, tc_hours, tc_mins, tc_secs, tc_frames, tc_fps,

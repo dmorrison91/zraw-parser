@@ -23,6 +23,17 @@ mkdir -p "$BUNDLE_DIR/Contents/Resources"
 
 cp "$EXEC" "$BUNDLE_DIR/Contents/MacOS/Zraw2DNG"
 
+# Bundle libcrypto.3.dylib (needed by libzraw) and set @rpath
+LIB_CRYPTO="/opt/homebrew/opt/openssl@3/lib/libcrypto.3.dylib"
+if [ -f "$LIB_CRYPTO" ]; then
+    mkdir -p "$BUNDLE_DIR/Contents/Frameworks"
+    cp "$LIB_CRYPTO" "$BUNDLE_DIR/Contents/Frameworks/libcrypto.3.dylib"
+    chmod 644 "$BUNDLE_DIR/Contents/Frameworks/libcrypto.3.dylib"
+    install_name_tool -id @rpath/libcrypto.3.dylib "$BUNDLE_DIR/Contents/Frameworks/libcrypto.3.dylib"
+    install_name_tool -change "$LIB_CRYPTO" @rpath/libcrypto.3.dylib "$BUNDLE_DIR/Contents/MacOS/Zraw2DNG"
+    install_name_tool -add_rpath @loader_path/../Frameworks "$BUNDLE_DIR/Contents/MacOS/Zraw2DNG"
+fi
+
 ICON="$SCRIPT_DIR/Zraw2DNG.icns"
 if [ -f "$ICON" ]; then
     cp "$ICON" "$BUNDLE_DIR/Contents/Resources/AppIcon.icns"
@@ -39,9 +50,9 @@ PLIST="<?xml version=\"1.0\" encoding=\"UTF-8\"?>
     <key>CFBundleName</key>
     <string>Zraw2DNG</string>
     <key>CFBundleVersion</key>
-    <string>1.0.1</string>
+    <string>1.0.2</string>
     <key>CFBundleShortVersionString</key>
-    <string>1.0.1</string>
+    <string>1.0.2</string>
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>LSMinimumSystemVersion</key>
@@ -56,6 +67,9 @@ echo "$PLIST" > "$BUNDLE_DIR/Contents/Info.plist"
 
 # Strip quarantine/Spotlight extended attributes and ad-hoc sign the bundle
 xattr -cr "$BUNDLE_DIR"
+if [ -d "$BUNDLE_DIR/Contents/Frameworks" ]; then
+    codesign --force --sign - "$BUNDLE_DIR/Contents/Frameworks/libcrypto.3.dylib"
+fi
 codesign --force --deep --sign - "$BUNDLE_DIR"
 
 echo "Created: $BUNDLE_DIR"

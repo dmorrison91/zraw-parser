@@ -230,19 +230,21 @@ func zrawDebayerToRGB(cfaPixels: [UInt16], width: Int, height: Int, bitsPerPixel
 
 func zrawApplyColorPipeline(rgb: inout [Float], width: Int, height: Int,
                              awbGainR: UInt32, awbGainG: UInt32, awbGainB: UInt32,
-                             ccm: [Int32]?) throws {
+                             ccm: [Int32]?, applyLogC3: Bool) throws {
     let hasCCM = (ccm != nil) ? 1 : 0
     let ret = rgb.withUnsafeMutableBufferPointer { buf in
         if let ccm = ccm {
             return ccm.withUnsafeBufferPointer { ccmBuf in
                 zraw_apply_color_pipeline(buf.baseAddress, Int32(width), Int32(height),
                                            awbGainR, awbGainG, awbGainB,
-                                           ccmBuf.baseAddress, Int32(hasCCM))
+                                           ccmBuf.baseAddress, Int32(hasCCM),
+                                           applyLogC3 ? 1 : 0)
             }
         } else {
             return zraw_apply_color_pipeline(buf.baseAddress, Int32(width), Int32(height),
                                                awbGainR, awbGainG, awbGainB,
-                                               nil, Int32(hasCCM))
+                                               nil, Int32(hasCCM),
+                                               applyLogC3 ? 1 : 0)
         }
     }
     guard ret == 0 else {
@@ -289,5 +291,99 @@ extension ZRAWFrameInfo {
         return try withUnsafePointer(to: &cStruct) { ptr in
             try body(ptr)
         }
+    }
+}
+
+// MARK: - Multi-Decoder
+
+struct ZRAWDecodeOptions {
+    let dngDir: String
+    let clipName: String
+    let cameraModel: String
+    let compressionType: Int32
+    let baselineExposure: Double
+    let framerateNum: UInt32
+    let framerateDen: UInt32
+    let reelName: String
+    let hasTimecode: Bool
+    let tcHours: UInt8
+    let tcMinutes: UInt8
+    let tcSeconds: UInt8
+    let tcFrames: UInt8
+    let tcFps: UInt32
+
+    func withCStruct<T>(_ body: (UnsafePointer<ZRAWDecodeOptions_C>) throws -> T) rethrows -> T {
+        var opts = ZRAWDecodeOptions_C()
+        return try dngDir.withCString { dngDirPtr in
+            try clipName.withCString { clipNamePtr in
+                try cameraModel.withCString { modelPtr in
+                    try reelName.withCString { reelPtr in
+                        opts.dng_dir = dngDirPtr
+                        opts.clip_name = clipNamePtr
+                        opts.camera_model = modelPtr
+                        opts.compression_type = compressionType
+                        opts.baseline_exposure = baselineExposure
+                        opts.framerate_num = framerateNum
+                        opts.framerate_den = framerateDen
+                        opts.reel_name = reelPtr
+                        opts.has_timecode = hasTimecode ? 1 : 0
+                        opts.tc_hours = UInt32(tcHours)
+                        opts.tc_minutes = UInt32(tcMinutes)
+                        opts.tc_seconds = UInt32(tcSeconds)
+                        opts.tc_frames = UInt32(tcFrames)
+                        opts.tc_fps = tcFps
+                        return try withUnsafePointer(to: &opts) { ptr in
+                            try body(ptr)
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+struct ZRAWDecodeResult {
+    let totalFrames: Int
+    let framesWritten: Int
+    let framesFailed: Int
+
+    init(_ c: ZRAWDecodeResult_C) {
+        totalFrames = Int(c.total_frames)
+        framesWritten = Int(c.frames_written)
+        framesFailed = Int(c.frames_failed)
+    }
+}
+
+final class ZrawMultiDecoder: @unchecked Sendable {
+    private let ptr: UnsafeMutableRawPointer
+
+    init(numThreads: Int = 0) {
+        ptr = zraw_multi_decoder_create(Int32(numThreads))
+    }
+
+    deinit {
+        zraw_multi_decoder_destroy(ptr)
+    }
+
+    var totalFrames: Int {
+        Int(zraw_multi_decoder_get_total(ptr))
+    }
+
+    var framesProcessed: Int {
+        Int(zraw_multi_decoder_get_processed(ptr))
+    }
+
+    func process(movPath: String, offsets: [UInt64], sizes: [UInt64], options: ZRAWDecodeOptions) throws -> ZRAWDecodeResult {
+        var result = ZRAWDecodeResult_C()
+        let ret = movPath.withCString { pathPtr in
+            options.withCStruct { optsPtr in
+                zraw_multi_decoder_process(ptr, pathPtr, offsets, sizes, UInt64(offsets.count), optsPtr, &result)
+            }
+        }
+        guard ret == 0 else {
+            let err = String(cString: zraw_last_error())
+            throw ZRAWError.decodingFailed(err)
+        }
+        return ZRAWDecodeResult(result)
     }
 }

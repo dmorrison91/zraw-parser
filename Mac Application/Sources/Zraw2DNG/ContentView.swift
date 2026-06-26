@@ -114,12 +114,21 @@ struct ContentView: View {
                     }
                     .contextMenu {
                         if item.status.isTerminal {
-                            Button("Reset") { Task { await vm.resetItem(at: i) } }
+                            Button("Reset") {
+                                Task {
+                                    for idx in selectedIndices.sorted() {
+                                        await vm.resetItem(at: idx)
+                                    }
+                                    selectedIndices.removeAll()
+                                }
+                            }
                         }
                         let activeIndex = vm.queue.indices.first { if case .processing = vm.queue[$0].status { return true }; return false }
-                        if i != activeIndex || activeIndex == nil {
+                        if selectedIndices.allSatisfy({ $0 != activeIndex }) || activeIndex == nil {
                             Button("Remove", role: .destructive) {
-                                vm.removeItems(at: IndexSet(integer: i))
+                                let toRemove = selectedIndices.isEmpty ? [i] : selectedIndices
+                                vm.removeItems(at: IndexSet(toRemove))
+                                selectedIndices.removeAll()
                             }
                         }
                     }

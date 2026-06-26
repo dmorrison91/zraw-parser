@@ -50,9 +50,9 @@ PLIST="<?xml version=\"1.0\" encoding=\"UTF-8\"?>
     <key>CFBundleName</key>
     <string>Zraw2DNG</string>
     <key>CFBundleVersion</key>
-    <string>1.0.4</string>
+    <string>32</string>
     <key>CFBundleShortVersionString</key>
-    <string>1.0.4</string>
+    <string>1.0.5</string>
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>LSMinimumSystemVersion</key>

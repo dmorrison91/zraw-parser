@@ -1,5 +1,6 @@
 #pragma once
 #include <stdint.h>
+#include <stddef.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -83,16 +84,51 @@ int zraw_process_frame(const uint8_t* frame_data, int size,
 int zraw_debayer_to_rgb(const uint16_t* cfa_pixels, int width, int height,
                          int bits_per_pixel, float* rgb_output);
 
-// Apply white balance + color matrix to RGB float
+// Apply white balance + color matrix + optional ARRI LogC3 encoding to RGB float
 // rgb is modified in-place (width * height * 3 floats)
 int zraw_apply_color_pipeline(float* rgb, int width, int height,
                                uint32_t awb_gain_r, uint32_t awb_gain_g, uint32_t awb_gain_b,
-                               const int32_t* ccm, int has_ccm);
+                               const int32_t* ccm, int has_ccm,
+                               int apply_logc3);
 
 // Set error message (thread-safe)
 void zraw_set_error(const char* msg);
 
 const char* zraw_last_error(void);
+
+// ------------------- Multi-Decoder API -------------------
+
+typedef struct {
+    const char* dng_dir;
+    const char* clip_name;
+    const char* camera_model;
+    int compression_type;
+    double baseline_exposure;
+    uint32_t framerate_num;
+    uint32_t framerate_den;
+    const char* reel_name;
+    int has_timecode;
+    uint32_t tc_hours;
+    uint32_t tc_minutes;
+    uint32_t tc_seconds;
+    uint32_t tc_frames;
+    uint32_t tc_fps;
+} ZRAWDecodeOptions_C;
+
+typedef struct {
+    size_t total_frames;
+    size_t frames_written;
+    size_t frames_failed;
+} ZRAWDecodeResult_C;
+
+void* zraw_multi_decoder_create(int num_threads);
+void  zraw_multi_decoder_destroy(void* decoder);
+int   zraw_multi_decoder_process(void* decoder, const char* mov_path,
+                                 const uint64_t* offsets, const uint64_t* sizes, uint64_t frame_count,
+                                 const ZRAWDecodeOptions_C* options,
+                                 ZRAWDecodeResult_C* result);
+size_t zraw_multi_decoder_get_total(void* decoder);
+size_t zraw_multi_decoder_get_processed(void* decoder);
 
 #ifdef __cplusplus
 }

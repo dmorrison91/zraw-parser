@@ -87,6 +87,9 @@ extern "C" {
     // Frees decoder
     LIB_ZRAW_PUBLIC zraw_decoder_state_t zraw_decoder__free(ZRAW_DECODER_HANDLE decoder);
 
+    // Resets decoder state for reuse (clears frame data and pixels)
+    LIB_ZRAW_PUBLIC zraw_decoder_state_t zraw_decoder__reset(ZRAW_DECODER_HANDLE decoder);
+
     // Returns last exception message
     LIB_ZRAW_PUBLIC const char* zraw_decoder__exception_message();
 

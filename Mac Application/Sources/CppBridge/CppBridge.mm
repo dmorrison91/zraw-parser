@@ -16,10 +16,13 @@
 
 #include "TinyMovFileLibrary.hpp"
 
+#include "zraw_multi_decoder.h"
+
 #pragma mark - Error Handling
 
 #include <mutex>
 static std::mutex s_errMutex;
+static std::mutex g_zraw_mutex;
 static std::string s_lastError;
 
 #define SET_ERROR(msg) do { \
@@ -251,6 +254,7 @@ void zraw_free_mov_info(ZRAWMovInfo_C* info) {
 int zraw_parse_frame(const uint8_t* frame_data, int size, ZRAWFrameInfo_C* info) {
     memset(info, 0, sizeof(*info));
 
+    std::lock_guard<std::mutex> lock(g_zraw_mutex);
     auto decoder = zraw_decoder__create();
     if (!decoder) {
         SET_ERROR("Failed to create ZRAW decoder");
@@ -291,6 +295,7 @@ int zraw_parse_frame(const uint8_t* frame_data, int size, ZRAWFrameInfo_C* info)
 int zraw_decompress_frame(const uint8_t* frame_data, int size,
                           uint16_t* pixels, int pixel_count)
 {
+    std::lock_guard<std::mutex> lock(g_zraw_mutex);
     auto decoder = zraw_decoder__create();
     if (!decoder) {
         SET_ERROR("Failed to create ZRAW decoder");
@@ -441,6 +446,10 @@ static int write_dng_from_pixels(const uint16_t* pixels, int w, int h, int bits,
         double white_levels[1] = {(double)((1 << bits) - 1)};
         dng_image.SetWhiteLevelRational(1, white_levels);
 
+        // Force framerate to exactly 24fps (24000/1000) for Resolve timeline compatibility
+        framerate_num = 24000;
+        framerate_den = 1000;
+
         // CinemaDNG timecode metadata
         if (has_timecode && tc_fps > 0) {
             fprintf(stderr, "[zraw] DNG timecode: %02d:%02d:%02d:%02d @ %d fps, reel=%s\n",
@@ -526,34 +535,37 @@ int zraw_process_frame(const uint8_t* frame_data, int size,
 
         std::vector<uint16_t> image_data(pixel_count);
 
-        auto decoder = zraw_decoder__create();
-        if (!decoder) {
-            SET_ERROR("Failed to create ZRAW decoder");
-            return -1;
-        }
+        {
+            std::lock_guard<std::mutex> lock(g_zraw_mutex);
+            auto decoder = zraw_decoder__create();
+            if (!decoder) {
+                SET_ERROR("Failed to create ZRAW decoder");
+                return -1;
+            }
 
-        auto st = zraw_decoder__read_hisi_frame(decoder, (void*)frame_data, size);
-        if (st != ZRAW_DECODER_STATE__FRAME_IS_READ) {
-            SET_ERROR("Failed to read ZRAW frame");
-            zraw_decoder__free(decoder);
-            return -1;
-        }
+            auto st = zraw_decoder__read_hisi_frame(decoder, (void*)frame_data, size);
+            if (st != ZRAW_DECODER_STATE__FRAME_IS_READ) {
+                SET_ERROR("Failed to read ZRAW frame");
+                zraw_decoder__free(decoder);
+                return -1;
+            }
 
-        st = zraw_decoder__decompress_hisi_frame(decoder);
-        if (st != ZRAW_DECODER_STATE__FRAME_IS_DECOMPRESSED) {
-            const char* msg = zraw_decoder__exception_message();
-            SET_ERROR(msg ? msg : "Failed to decompress ZRAW frame");
-            zraw_decoder__free(decoder);
-            return -1;
-        }
+            st = zraw_decoder__decompress_hisi_frame(decoder);
+            if (st != ZRAW_DECODER_STATE__FRAME_IS_DECOMPRESSED) {
+                const char* msg = zraw_decoder__exception_message();
+                SET_ERROR(msg ? msg : "Failed to decompress ZRAW frame");
+                zraw_decoder__free(decoder);
+                return -1;
+            }
 
-        auto cfa_state = zraw_decoder__get_decompressed_CFA(decoder, image_data.data(), (int)(image_data.size() * sizeof(uint16_t)));
-        if (cfa_state != ZRAW_DECODER_STATE__STANDBY) {
-            SET_ERROR("Failed to get decompressed CFA");
+            auto cfa_state = zraw_decoder__get_decompressed_CFA(decoder, image_data.data(), (int)(image_data.size() * sizeof(uint16_t)));
+            if (cfa_state != ZRAW_DECODER_STATE__STANDBY) {
+                SET_ERROR("Failed to get decompressed CFA");
+                zraw_decoder__free(decoder);
+                return -1;
+            }
             zraw_decoder__free(decoder);
-            return -1;
         }
-        zraw_decoder__free(decoder);
 
         fprintf(stderr, "[zraw] process_frame timecode: has=%d %02d:%02d:%02d:%02d @ %d fps, framerate=%d/%d\n",
                 has_timecode, tc_hours, tc_mins, tc_secs, tc_frames, tc_fps,
@@ -692,9 +704,17 @@ int zraw_debayer_to_rgb(const uint16_t* cfa_pixels, int width, int height,
 
 #pragma mark - Color Pipeline
 
+// ARRI LogC3 encoding curve
+static inline float logc3_encode(float x) {
+    if (x < 0.0f) return 0.0f;
+    if (x < 0.0003f) return 5.0f * x + 0.045f;
+    return 0.247190f * log10f(24.7920f * x + 1.0f) + 0.385537f;
+}
+
 int zraw_apply_color_pipeline(float* rgb, int width, int height,
                                uint32_t awb_gain_r, uint32_t awb_gain_g, uint32_t awb_gain_b,
-                               const int32_t* ccm, int has_ccm) {
+                               const int32_t* ccm, int has_ccm,
+                               int apply_logc3) {
     if (!rgb || width < 1 || height < 1) {
         SET_ERROR("Invalid color pipeline parameters");
         return -1;
@@ -715,7 +735,7 @@ int zraw_apply_color_pipeline(float* rgb, int width, int height,
             }
         }
 
-        // XYZ to Wide Gamut matrix (computed from AWG primaries + D65)
+        // XYZ to ARRI Wide Gamut matrix (computed from AWG primaries + D65)
         float xyz_to_awg[9] = {
             2.094f, -0.591f, -0.353f,
             -0.829f, 1.765f, 0.024f,
@@ -756,6 +776,11 @@ int zraw_apply_color_pipeline(float* rgb, int width, int height,
             g = g < 0 ? 0 : (g > 1 ? 1 : g);
             b = b < 0 ? 0 : (b > 1 ? 1 : b);
 
+            if (apply_logc3) {
+                r = logc3_encode(r);
+                g = logc3_encode(g);
+                b = logc3_encode(b);
+            }
 
             rgb[i * 3] = r;
             rgb[i * 3 + 1] = g;
@@ -769,6 +794,131 @@ int zraw_apply_color_pipeline(float* rgb, int width, int height,
     }
     catch (...) {
         SET_ERROR("Unknown error in color pipeline");
+        return -1;
+    }
+}
+
+#pragma mark - Multi-Decoder Bridge
+
+void* zraw_multi_decoder_create(int num_threads)
+{
+    return new ZrawMultiDecoder(num_threads);
+}
+
+void zraw_multi_decoder_destroy(void* decoder)
+{
+    delete static_cast<ZrawMultiDecoder*>(decoder);
+}
+
+size_t zraw_multi_decoder_get_total(void* decoder)
+{
+    return static_cast<ZrawMultiDecoder*>(decoder)->get_total_frames();
+}
+
+size_t zraw_multi_decoder_get_processed(void* decoder)
+{
+    return static_cast<ZrawMultiDecoder*>(decoder)->get_frames_processed();
+}
+
+int zraw_multi_decoder_process(void* decoder, const char* mov_path,
+                               const uint64_t* offsets, const uint64_t* sizes, uint64_t frame_count,
+                               const ZRAWDecodeOptions_C* options,
+                               ZRAWDecodeResult_C* result)
+{
+    try {
+        auto* multi = static_cast<ZrawMultiDecoder*>(decoder);
+
+        // Build FrameLocation vector
+        std::vector<FrameLocation> locations(frame_count);
+        for (uint64_t i = 0; i < frame_count; ++i) {
+            locations[i].offset_in_file = offsets[i];
+            locations[i].size = static_cast<uint32_t>(sizes[i]);
+        }
+
+        // Copy string params to ensure lifetime (captured by value in lambda)
+        std::string dng_dir(options->dng_dir ? options->dng_dir : "");
+        std::string clip_name(options->clip_name ? options->clip_name : "");
+        std::string camera_model(options->camera_model ? options->camera_model : "");
+        std::string reel_name(options->reel_name ? options->reel_name : "");
+        int comp_type = options->compression_type;
+        double be = options->baseline_exposure;
+        uint32_t framerate_num = options->framerate_num;
+        uint32_t framerate_den = options->framerate_den;
+
+        // Force framerate to exactly 24fps (24000/1000) for Resolve timeline compatibility
+        framerate_num = 24000;
+        framerate_den = 1000;
+
+        uint32_t tc_fps = options->tc_fps;
+        int has_tc = options->has_timecode;
+
+        // Starting timecode in frames
+        uint32_t tc_hours = options->tc_hours;
+        uint32_t tc_mins = options->tc_minutes;
+        uint32_t tc_secs = options->tc_seconds;
+        uint32_t tc_frames = options->tc_frames;
+
+        auto callback = [=](const RawFrame& raw_frame, const zraw_frame_info_t& info,
+                            const uint16_t* cfa_data, size_t cfa_size_in_bytes)
+        {
+            (void)cfa_size_in_bytes;
+
+            // Compute timecode for this frame (same formula used in
+            // timecodeFromFrames() on the Swift side)
+            uint32_t tc_start = tc_hours * tc_fps * 3600 + tc_mins * tc_fps * 60 + tc_secs * tc_fps + tc_frames;
+            uint32_t total_tc = tc_start + (uint32_t)raw_frame.frame_index;
+            uint8_t dng_tc_h = (uint8_t)(total_tc / (tc_fps * 3600));
+            uint8_t dng_tc_m = (uint8_t)((total_tc / (tc_fps * 60)) % 60);
+            uint8_t dng_tc_s = (uint8_t)((total_tc / tc_fps) % 60);
+            uint8_t dng_tc_f = (uint8_t)(total_tc % tc_fps);
+
+            // Log first frame + every 500th frame for verification
+            if (raw_frame.frame_index == 0 || raw_frame.frame_index % 500 == 0) {
+                fprintf(stderr, "[dng-tc] frame=%zu input_tc=%02d:%02d:%02d:%02d tc_fps=%u tc_start=%u total_tc=%u dng_tc=%02d:%02d:%02d:%02d\n",
+                        raw_frame.frame_index,
+                        tc_hours, tc_mins, tc_secs, tc_frames,
+                        tc_fps,
+                        tc_start, total_tc,
+                        dng_tc_h, dng_tc_m, dng_tc_s, dng_tc_f);
+            }
+
+            // Build DNG path
+            char dng_path[1024];
+            snprintf(dng_path, sizeof(dng_path), "%s/%s_%04zu.dng",
+                     dng_dir.c_str(), clip_name.c_str(), raw_frame.frame_index + 1);
+
+            write_dng_from_pixels(cfa_data,
+                                  (int)info.width_in_photodiodes,
+                                  (int)info.height_in_photodiodes,
+                                  (int)info.bits_per_photodiode_value,
+                                  info.cfa_black_levels,
+                                  info.awb_gain_r, info.awb_gain_g, info.awb_gain_b,
+                                  info.ccm_values, info.ccm_temp,
+                                  dng_path, comp_type, camera_model.c_str(),
+                                  be, info.wb_in_K,
+                                  has_tc,
+                                  dng_tc_h, dng_tc_m, dng_tc_s, dng_tc_f,
+                                  tc_fps,
+                                  framerate_num, framerate_den,
+                                  reel_name.c_str());
+        };
+
+        auto r = multi->process_file(mov_path, locations, callback);
+
+        if (result) {
+            result->total_frames = r.total_frames;
+            result->frames_written = r.successful;
+            result->frames_failed = r.failed;
+        }
+
+        return 0;
+    }
+    catch (const std::exception& e) {
+        SET_ERROR(e.what());
+        return -1;
+    }
+    catch (...) {
+        SET_ERROR("Unknown error in multi_decoder_process");
         return -1;
     }
 }

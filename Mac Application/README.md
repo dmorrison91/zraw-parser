@@ -8,7 +8,7 @@ C library for decoding and processing ZRAW video files (Z CAM cameras). Extracts
 - Decompress CFA sensor data
 - Extract frame metadata: white balance gains, color correction matrices, black levels, color temperature
 - Write DNG files with full CinemaDNG metadata (timecode, frame rate, reel name, color matrices)
-- Debayer CFA to RGB
+- Debayer to RGB with ARRI LogC3 encoding pipeline
 - WAV audio extraction with iXML/bext timecode metadata
 
 ## Building
@@ -52,19 +52,6 @@ Click "Cancel" to stop. Partially processed files are marked as cancelled; alrea
 **5. Log**
 
 Toggle the Log panel at the bottom of the window to view console output. Use "Copy All" to copy the log to the clipboard or "Clear" to reset.
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 ### As a library
 

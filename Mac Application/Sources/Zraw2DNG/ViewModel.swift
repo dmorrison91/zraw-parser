@@ -134,16 +134,18 @@ class ViewModel: ObservableObject {
 
     func resetItem(at index: Int) async {
         guard index < queue.count else { return }
+        // Reset to pending without reloading the file — info is already parsed.
+        // The item will be picked up by the next explicit Start Queue click.
         queue[index].status = .pending
         queue[index].error = nil
-        await loadItems()
     }
 
     func clearAll() {
-        batchTask?.cancel()
-        queue.removeAll()
-        isProcessing = false
-        statusMessage = "Ready"
+        cancelConversion()
+        // Remove queue on next MainActor cycle so any in-flight MainActor.run blocks drain first
+        Task { @MainActor in
+            queue.removeAll()
+        }
     }
 
     func chooseOutputDir() {
@@ -226,23 +228,30 @@ class ViewModel: ObservableObject {
                 }
 
                 guard !Task.isCancelled else {
-                    await MainActor.run { queue[i].status = .cancelled }
+                    await MainActor.run { guard queue.indices.contains(i) else { return }; queue[i].status = .cancelled }
                     continue
                 }
 
                 await MainActor.run {
+                    guard queue.indices.contains(i) else { return }
                     queue[i].status = .processing(0, queue[i].movieInfo?.frameCount ?? 0)
                 }
 
                 do {
                     try await processFile(at: i)
-                    await MainActor.run { queue[i].status = .completed }
+                    // Respect cancellation — don't mark as completed if user cancelled mid-run
+                    if Task.isCancelled {
+                        await MainActor.run { guard queue.indices.contains(i) else { return }; queue[i].status = .cancelled }
+                    } else {
+                        await MainActor.run { guard queue.indices.contains(i) else { return }; queue[i].status = .completed }
+                    }
                 } catch {
                     if Task.isCancelled {
-                        await MainActor.run { queue[i].status = .cancelled }
+                        await MainActor.run { guard queue.indices.contains(i) else { return }; queue[i].status = .cancelled }
                     } else {
                         let msg = error.localizedDescription
                         await MainActor.run {
+                            guard queue.indices.contains(i) else { return }
                             queue[i].status = .failed(msg)
                             queue[i].error = msg
                         }
@@ -265,8 +274,9 @@ class ViewModel: ObservableObject {
 
     func cancelConversion() {
         batchTask?.cancel()
+        // Cancel the entire queue — mark every non-terminal item as cancelled
         for i in queue.indices {
-            if case .processing = queue[i].status {
+            if !queue[i].status.isTerminal {
                 queue[i].status = .cancelled
             }
         }
@@ -291,7 +301,6 @@ class ViewModel: ObservableObject {
         let fileHandle = try FileHandle(forReadingFrom: item.url)
         defer { try? fileHandle.close() }
 
-        let totalFrames = info.frameCount
         let comp = options.compression
         let baselineExposure = options.baselineExposure
         let cameraModel: String
@@ -308,46 +317,56 @@ class ViewModel: ObservableObject {
         }
         let firstFrameInfo = try zrawParseFrame(data: firstFrameData)
 
-        // Debug: log parsed timecode info
-        if info.hasTimecode {
-            print("[zraw] Start TC: \(info.timecodeString) @ \(info.timecodeFps) fps | " +
-                  "hours=\(info.timecodeHours) mins=\(info.timecodeMinutes) " +
-                  "secs=\(info.timecodeSeconds) frames=\(info.timecodeFrames)")
+        // ——— Single source of truth for timecode ———
+        // Compute the starting frame count ONCE, using the same formula as the
+        // DNG callback in CppBridge.mm (see zraw_multi_decoder_process lambda).
+        // Both DNG and WAV timecodes are derived from this single value so they
+        // can never diverge.
+        let tcFps = info.timecodeFps
+        let tcStartFrames: UInt32
+        if info.hasTimecode && tcFps > 0 {
+            tcStartFrames = info.timecodeStartFrame
         } else {
-            print("[zraw] No timecode track found in MOV")
+            tcStartFrames = 0
         }
+        // Reconstruct HH:MM:SS:FF using the identical arithmetic as the C++
+        // DNG callback: total_tc = tc_start + frame_index, then divide out.
+        let tcRecon = timecodeFromFrames(tcStartFrames, fps: tcFps)
 
-        // Audio extraction
+        print("==========================================")
+        print("[timecode] CLIP: \(clipName)")
+        print("[timecode] Source info.timecodeString = \(info.timecodeString)")
+        print("[timecode] tcFps  = \(tcFps)")
+        print("[timecode] tcStartFrames = \(tcStartFrames)")
+        print("[timecode] Reconstructed  = \(String(format: "%02d:%02d:%02d:%02d", tcRecon.hours, tcRecon.minutes, tcRecon.seconds, tcRecon.frames))")
+        let matchStr = info.timecodeString == String(format: "%02d:%02d:%02d:%02d", tcRecon.hours, tcRecon.minutes, tcRecon.seconds, tcRecon.frames) ? "MATCH" : "MISMATCH"
+        print("[timecode] Comparison: \(matchStr)")
+        print("[timecode] Audio sample rate: \(info.audioSampleRate) Hz")
+        print("==========================================")
+
+        // Audio extraction — pass the reconstructed timecode (same as DNG)
         if info.hasAudio {
             do {
-                try await extractAudio(from: item.url, outputDir: workDir, clipName: clipName, info: info)
+                try await extractAudio(from: item.url, outputDir: workDir, clipName: clipName, info: info,
+                                       hasTimecode: info.hasTimecode && tcFps > 0,
+                                       tcHours: tcRecon.hours, tcMinutes: tcRecon.minutes,
+                                       tcSeconds: tcRecon.seconds, tcFrames: tcRecon.frames,
+                                       timecodeFps: tcFps)
             } catch {
                 queue[index].error = "Audio extraction failed: \(error.localizedDescription)"
             }
         }
 
-        let tcHours = info.timecodeHours
-        let tcMins = info.timecodeMinutes
-        let tcSecs = info.timecodeSeconds
-        let tcFrames = info.timecodeFrames
-        let tcFps = info.timecodeFps
-
         let reel = tcFps > 0 ? clipName.components(separatedBy: "_").first ?? clipName : ""
 
-        // Debug: log expected timecode for first and last frames
-        if info.hasTimecode && tcFps > 0 {
-            let firstTC = timecodeForFrame(0, tcHours: tcHours, tcMins: tcMins, tcSecs: tcSecs, tcFrames: tcFrames, fps: tcFps)
-            let lastTC = timecodeForFrame(totalFrames - 1, tcHours: tcHours, tcMins: tcMins, tcSecs: tcSecs, tcFrames: tcFrames, fps: tcFps)
-            print("[zraw] Frame 0 TC: \(firstTC.hours):\(firstTC.minutes):\(firstTC.seconds):\(firstTC.frames)")
-            print("[zraw] Frame \(totalFrames - 1) TC: \(lastTC.hours):\(lastTC.minutes):\(lastTC.seconds):\(lastTC.frames)")
-        }
-
+        // DNG processing — pass the same reconstructed timecode
         try await processDNG(fileURL: item.url, chunkOffsets: info.chunkOffsets,
                              sampleSizes: info.sampleSizes, info: info,
                              firstFrameInfo: firstFrameInfo,
                              workDir: workDir, clipName: clipName, cameraModel: cameraModel,
                              comp: comp, baselineExposure: baselineExposure,
-                             tcHours: tcHours, tcMins: tcMins, tcSecs: tcSecs, tcFrames: tcFrames,
+                             tcHours: tcRecon.hours, tcMins: tcRecon.minutes,
+                             tcSecs: tcRecon.seconds, tcFrames: tcRecon.frames,
                              tcFps: tcFps,
                              framerateNum: info.framerateNum, framerateDen: info.framerateDen,
                              reel: reel, index: index)
@@ -364,151 +383,62 @@ class ViewModel: ObservableObject {
                              tcFps: UInt32,
                              framerateNum: UInt32, framerateDen: UInt32,
                              reel: String, index: Int) async throws {
-        let totalFrames = chunkOffsets.count
-        let fi = firstFrameInfo
-        let compRaw = Int32(comp.rawValue)
-        let cam = cameraModel
-        let be = baselineExposure
-        let hasTc = info.hasTimecode
-        let fps = tcFps
-        let rn = reel
-        let maxConcurrent = options.maxConcurrentFrames
+        print("[timecode] DNG opts: tc=\(tcHours):\(tcMins):\(tcSecs):\(tcFrames) @ \(tcFps) fps, framerate=\(framerateNum)/\(framerateDen)")
 
-        let frameErrors = LockedArray<String>()
+        let opts = ZRAWDecodeOptions(
+            dngDir: workDir.path,
+            clipName: clipName,
+            cameraModel: cameraModel,
+            compressionType: Int32(comp.rawValue),
+            baselineExposure: baselineExposure,
+            framerateNum: framerateNum,
+            framerateDen: framerateDen,
+            reelName: reel,
+            hasTimecode: info.hasTimecode,
+            tcHours: tcHours,
+            tcMinutes: tcMins,
+            tcSeconds: tcSecs,
+            tcFrames: tcFrames,
+            tcFps: tcFps
+        )
 
-        try await withThrowingTaskGroup(of: (Int, Error?).self) { group in
-            var nextFrame = 0
-            var active = 0
-            var completed = 0
+        let decoder = ZrawMultiDecoder(numThreads: options.maxConcurrentFrames)
 
-            func submitNext() {
-                while nextFrame < totalFrames && active < maxConcurrent {
-                    let frameIdx = nextFrame
-                    nextFrame += 1
-                    active += 1
-
-                    group.addTask { [frameIdx] in
-                        try Task.checkCancellation()
-                        let tcf = timecodeForFrame(frameIdx, tcHours: tcHours, tcMins: tcMins,
-                                                    tcSecs: tcSecs, tcFrames: tcFrames, fps: fps)
-                        let dngPath = workDir.appendingPathComponent(
-                            String(format: "%@_%04d.dng", clipName, frameIdx + 1)
-                        ).path
-
-                        do {
-                            try await Task.detached {
-                                let fh = try FileHandle(forReadingFrom: fileURL)
-                                try fh.seek(toOffset: chunkOffsets[frameIdx])
-                                guard let frameData = try fh.read(upToCount: Int(sampleSizes[frameIdx])) else {
-                                    throw ZRAWError.decodingFailed("Failed to read frame \(frameIdx)")
-                                }
-                                try fh.close()
-                                try zrawProcessFrame(
-                                    data: frameData,
-                                    frameInfo: fi,
-                                    dngPath: dngPath,
-                                    compressionType: compRaw,
-                                    cameraModel: cam,
-                                    baselineExposure: be,
-                                    wbKelvin: fi.wbKelvin,
-                                    hasTimecode: hasTc,
-                                    timecodeHours: tcf.hours,
-                                    timecodeMinutes: tcf.minutes,
-                                    timecodeSeconds: tcf.seconds,
-                                    timecodeFrames: tcf.frames,
-                                    timecodeFps: fps,
-                                    framerateNum: framerateNum,
-                                    framerateDen: framerateDen,
-                                    reelName: rn
-                                )
-                            }.value
-                            return (frameIdx, nil)
-                        } catch {
-                            return (frameIdx, error)
-                        }
+        let pollingTask = Task { [weak self] in
+            while !Task.isCancelled {
+                guard !Task.isCancelled else { break }
+                try? await Task.sleep(nanoseconds: 100_000_000)
+                guard !Task.isCancelled else { break }
+                let processed = decoder.framesProcessed
+                let total = decoder.totalFrames
+                if total > 0 {
+                    await MainActor.run {
+                        guard let self else { return }
+                        guard !self.queue[index].status.isTerminal else { return }
+                        self.queue[index].status = .processing(processed, total)
                     }
                 }
             }
-
-            submitNext()
-
-            for try await (frameIdx, error) in group {
-                active -= 1
-                completed += 1
-                if let error = error {
-                    frameErrors.append("Frame \(frameIdx + 1): \(error.localizedDescription)")
-                }
-
-                await MainActor.run {
-                    queue[index].status = .processing(completed, totalFrames)
-                }
-
-                submitNext()
-            }
         }
 
-        // Retry missing frames
-        let missingFrames = (0..<totalFrames).compactMap { i -> Int? in
-            let path = workDir.appendingPathComponent(String(format: "%@_%04d.dng", clipName, i + 1))
-            return fileManager.fileExists(atPath: path.path) ? nil : i
-        }
+        defer { pollingTask.cancel() }
 
-        for missingIdx in missingFrames {
-            let tcf = timecodeForFrame(missingIdx, tcHours: tcHours, tcMins: tcMins,
-                                        tcSecs: tcSecs, tcFrames: tcFrames, fps: fps)
-            let dngPath = workDir.appendingPathComponent(
-                String(format: "%@_%04d.dng", clipName, missingIdx + 1)
-            ).path
+        let result = try await Task.detached {
+            try decoder.process(movPath: fileURL.path, offsets: chunkOffsets, sizes: sampleSizes, options: opts)
+        }.value
 
-            do {
-                try await Task.detached {
-                    let fh = try FileHandle(forReadingFrom: fileURL)
-                    try fh.seek(toOffset: chunkOffsets[missingIdx])
-                    guard let frameData = try fh.read(upToCount: Int(sampleSizes[missingIdx])) else {
-                        throw ZRAWError.decodingFailed("Failed to read frame \(missingIdx) (retry)")
-                    }
-                    try fh.close()
-                    try zrawProcessFrame(
-                        data: frameData,
-                        frameInfo: fi,
-                        dngPath: dngPath,
-                        compressionType: compRaw,
-                        cameraModel: cam,
-                        baselineExposure: be,
-                        wbKelvin: fi.wbKelvin,
-                        hasTimecode: hasTc,
-                        timecodeHours: tcf.hours,
-                        timecodeMinutes: tcf.minutes,
-                        timecodeSeconds: tcf.seconds,
-                        timecodeFrames: tcf.frames,
-                        timecodeFps: fps,
-                        framerateNum: framerateNum,
-                        framerateDen: framerateDen,
-                        reelName: rn
-                    )
-                }.value
-            } catch {
-                frameErrors.append("Frame \(missingIdx + 1) (retry): \(error.localizedDescription)")
-            }
-        }
-
-        let errors = frameErrors.values
-        if !errors.isEmpty {
-            let msg = errors.joined(separator: "\n")
-            await MainActor.run {
-                if let existing = queue[index].error {
-                    queue[index].error = "\(existing)\n\(msg)"
-                } else {
-                    queue[index].error = msg
-                }
-            }
+        if result.framesFailed > 0 {
+            appendLog("\(clipName): \(result.framesFailed) frames failed")
         }
     }
 
     // MARK: - Audio Extraction
 
     private func extractAudio(from fileURL: URL, outputDir: URL, clipName: String,
-                               info: ZRAWMovInfo) async throws
+                                info: ZRAWMovInfo,
+                                hasTimecode: Bool,
+                                tcHours: UInt8, tcMinutes: UInt8, tcSeconds: UInt8, tcFrames: UInt8,
+                                timecodeFps: UInt32) async throws
     {
         let asset = AVURLAsset(url: fileURL)
         let audioTracks = try await asset.loadTracks(withMediaType: .audio)
@@ -517,6 +447,7 @@ class ViewModel: ObservableObject {
         let reader = try AVAssetReader(asset: asset)
         let outputSettings: [String: Any] = [
             AVFormatIDKey: kAudioFormatLinearPCM,
+            AVSampleRateKey: info.audioSampleRate,
             AVLinearPCMBitDepthKey: info.audioSampleSize,
             AVNumberOfChannelsKey: info.audioChannels,
             AVLinearPCMIsFloatKey: false,
@@ -533,33 +464,122 @@ class ViewModel: ObservableObject {
         var audioData = Data()
         while let sampleBuffer = output.copyNextSampleBuffer() {
             if Task.isCancelled { break }
+
             if let blockBuffer = sampleBuffer.dataBuffer {
                 var ptr: UnsafeMutablePointer<Int8>?
                 var len: Int = 0
-                CMBlockBufferGetDataPointer(blockBuffer, atOffset: 0, lengthAtOffsetOut: nil,
-                                           totalLengthOut: &len, dataPointerOut: &ptr)
-                if let p = ptr {
+                let status = CMBlockBufferGetDataPointer(
+                    blockBuffer, atOffset: 0,
+                    lengthAtOffsetOut: &len,
+                    totalLengthOut: nil,
+                    dataPointerOut: &ptr
+                )
+                if status == kCMBlockBufferNoErr, let p = ptr, len > 0 {
                     audioData.append(UnsafeRawPointer(p).assumingMemoryBound(to: UInt8.self), count: len)
+                }
+            } else {
+                var blockBufForList: CMBlockBuffer?
+                var listSize: Int = 0
+                let os = CMSampleBufferGetAudioBufferListWithRetainedBlockBuffer(
+                    sampleBuffer,
+                    bufferListSizeNeededOut: &listSize,
+                    bufferListOut: nil,
+                    bufferListSize: 0,
+                    blockBufferAllocator: nil,
+                    blockBufferMemoryAllocator: nil,
+                    flags: 0,
+                    blockBufferOut: &blockBufForList
+                )
+                if os == noErr, listSize > 0 {
+                    let abl = UnsafeMutablePointer<AudioBufferList>.allocate(capacity: 1)
+                    abl.initialize(to: AudioBufferList(
+                        mNumberBuffers: UInt32(info.audioChannels),
+                        mBuffers: AudioBuffer()
+                    ))
+                    defer { abl.deinitialize(count: 1); abl.deallocate() }
+
+                    let os2 = CMSampleBufferGetAudioBufferListWithRetainedBlockBuffer(
+                        sampleBuffer,
+                        bufferListSizeNeededOut: nil,
+                        bufferListOut: abl,
+                        bufferListSize: listSize,
+                        blockBufferAllocator: nil,
+                        blockBufferMemoryAllocator: nil,
+                        flags: 0,
+                        blockBufferOut: &blockBufForList
+                    )
+                    if os2 == noErr {
+                        let bufList = UnsafeMutableAudioBufferListPointer(abl)
+                        for i in 0..<bufList.count {
+                            let buf = bufList[i]
+                            if let data = buf.mData, buf.mDataByteSize > 0 {
+                                audioData.append(data.assumingMemoryBound(to: UInt8.self),
+                                                 count: Int(buf.mDataByteSize))
+                            }
+                        }
+                    }
                 }
             }
         }
 
+        guard reader.status != .failed else {
+            let msg = reader.error?.localizedDescription ?? "unknown error"
+            throw ZRAWError.audioExtractionFailed("AVAssetReader failed mid-stream: \(msg)")
+        }
+
         guard !Task.isCancelled else { return }
 
+        let byteRatePerSample = UInt32(info.audioChannels) * UInt32(info.audioSampleSize / 8)
+        let videoDuration = Double(info.frameCount) / info.framerate
+        let expectedBytes = Int(videoDuration * Double(info.audioSampleRate) * Double(byteRatePerSample))
+        print("[audio] \(clipName): expected ~\(expectedBytes) bytes, got \(audioData.count) bytes")
+
+        // Log WAV timecode — using the video framerate so the logged
+        // TimeReference matches what BEXT actually writes in WAVWriter.
+        let tcStr = String(format: "%02d:%02d:%02d:%02d", tcHours, tcMinutes, tcSeconds, tcFrames)
+        if hasTimecode {
+            let totalSec = Double(tcHours) * 3600.0 + Double(tcMinutes) * 60.0 + Double(tcSeconds) + Double(tcFrames) / info.framerate
+            let sampleRef = UInt64((totalSec * Double(info.audioSampleRate)).rounded())
+            print("[wav] \(clipName): TIME=\(tcStr) tc_fps=\(timecodeFps) framerate=\(info.framerate) TimeReference=\(sampleRef) @ \(Int(info.audioSampleRate)) Hz")
+        } else {
+            print("[wav] \(clipName): TIME=none (no timecode)")
+        }
+
         let wavPath = outputDir.appendingPathComponent("\(clipName).wav")
+
         let writer = WAVWriter(
             numChannels: UInt16(info.audioChannels),
             sampleRate: UInt32(info.audioSampleRate),
             bitsPerSample: UInt16(info.audioSampleSize),
-            reelName: info.hasTimecode ? clipName.components(separatedBy: "_").first : nil,
-            timecode: info.hasTimecode ? (info.timecodeHours, info.timecodeMinutes, info.timecodeSeconds, info.timecodeFrames) : nil,
-            timecodeFps: info.hasTimecode ? info.timecodeFps : nil
+            reelName: hasTimecode ? clipName.components(separatedBy: "_").first : nil,
+            timecode: hasTimecode ? (tcHours, tcMinutes, tcSeconds, tcFrames) : nil,
+            timecodeFps: hasTimecode ? timecodeFps : nil,
+            framerate: info.framerate,
+            framerateNumerator: info.framerateNum,
+            framerateDenominator: info.framerateDen
         )
         try writer.write(audioData: audioData, to: wavPath)
     }
 }
 
 // MARK: - Helpers
+
+/// Reconstruct HH:MM:SS:FF from total frame count, using the same
+/// formula as the DNG callback in CppBridge.mm:
+///   total_tc = tc_start + frame_index
+///   h = total_tc / (fps * 3600)
+///   m = (total_tc / (fps * 60)) % 60
+///   s = (total_tc / fps) % 60
+///   f = total_tc % fps
+private func timecodeFromFrames(_ frames: UInt32, fps: UInt32) -> (hours: UInt8, minutes: UInt8, seconds: UInt8, frames: UInt8) {
+    guard fps > 0 else { return (0, 0, 0, 0) }
+    return (
+        UInt8(frames / (fps * 3600)),
+        UInt8((frames / (fps * 60)) % 60),
+        UInt8((frames / fps) % 60),
+        UInt8(frames % fps)
+    )
+}
 
 private func timecodeForFrame(_ frameIndex: Int,
                                tcHours: UInt8, tcMins: UInt8, tcSecs: UInt8, tcFrames: UInt8,
@@ -578,18 +598,4 @@ private func timecodeForFrame(_ frameIndex: Int,
     )
 }
 
-// Thread-safe array wrapper for concurrent error collection
-private final class LockedArray<T>: @unchecked Sendable {
-    private var storage: [T] = []
-    private let lock = NSLock()
 
-    func append(_ element: T) {
-        lock.lock(); defer { lock.unlock() }
-        storage.append(element)
-    }
-
-    var values: [T] {
-        lock.lock(); defer { lock.unlock() }
-        return storage
-    }
-}

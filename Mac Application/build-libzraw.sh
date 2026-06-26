@@ -3,7 +3,7 @@ set -euo pipefail
 
 cd "$(dirname "$0")"
 
-ZRAW_DECODER_LIB="/Users/derekmorrison/projects/ZRAWConverter/zraw-decoder-lib"
+ZRAW_DECODER_LIB="/Users/derekmorrison/projects/storyboardcreativity/zraw-decoder-lib-3e78ca61d288df9fe1704e107820666c828756d8"
 
 echo "=== Building libzraw.a ==="
 make -C "$ZRAW_DECODER_LIB" static_lib \

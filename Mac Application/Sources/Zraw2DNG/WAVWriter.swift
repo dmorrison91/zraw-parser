@@ -51,75 +51,106 @@ struct WAVWriter {
     //     return totalFrames * UInt64(sampleRate) / UInt64(fps)
     // }
 
-    func write(audioData: Data, to url: URL) throws {
+    /// Write WAV by streaming raw PCM data from a file on disk.
+    /// Never accumulates the full audio data in memory — the WAV is built
+    /// sequentially via FileHandle, and the PCM payload is read in 64KB chunks.
+    /// - Parameters:
+    ///   - pcmURL: URL of a file containing raw PCM samples (no headers).
+    ///   - wavURL: Destination URL for the complete WAV file.
+    func writeStreaming(pcmURL: URL, to wavURL: URL) throws {
         guard numChannels > 0, sampleRate > 0, bitsPerSample > 0 else {
             throw ZRAWError.audioExtractionFailed("Invalid WAV parameters (channels=\(numChannels), rate=\(sampleRate), bits=\(bitsPerSample))")
         }
         let byteRate = sampleRate * UInt32(numChannels) * UInt32(bitsPerSample / 8)
         let blockAlign = numChannels * (bitsPerSample / 8)
-        let dataSize = UInt32(audioData.count)
-        let audioDurationSec = Double(audioData.count) / Double(byteRate)
+        let attrs = try FileManager.default.attributesOfItem(atPath: pcmURL.path)
+        let pcmFileSize = (attrs[.size] as? UInt64) ?? 0
+        let dataSize = UInt32(pcmFileSize)
+        let audioDurationSec = Double(pcmFileSize) / Double(byteRate)
         if dataSize > 0 {
-            print("[wav] writing \(audioData.count) bytes (~\(String(format: "%.2f", audioDurationSec))s) to \(url.lastPathComponent)")
+            print("[wav] streaming \(pcmFileSize) bytes (~\(String(format: "%.2f", audioDurationSec))s) to \(wavURL.lastPathComponent)")
         }
 
-        // Log timecode metadata for sync debugging
         if let tc = timecode {
             let tcStr = String(format: "%02d:%02d:%02d:%02d", tc.hours, tc.minutes, tc.seconds, tc.frames)
             print("[wav] TC start=\(tcStr) tc_fps=\(timecodeFps ?? 24) framerate=\(framerate) @ \(sampleRate) Hz")
         }
 
-        var wav = Data()
+        // Create output file and open for writing
+        try FileManager.default.createDirectory(at: wavURL.deletingLastPathComponent(),
+                                                withIntermediateDirectories: true)
+        FileManager.default.createFile(atPath: wavURL.path, contents: nil, attributes: nil)
+        let wavFH = try FileHandle(forWritingTo: wavURL)
+        defer { try? wavFH.close() }
 
-        // RIFF header
-        wav.append("RIFF".data(using: .ascii)!)
-        let fileSizePos = wav.count
-        wav.append(contentsOf: [UInt8](repeating: 0, count: 4))
-        wav.append("WAVE".data(using: .ascii)!)
+        // RIFF header (placeholder for file size, filled at end)
+        wavFH.write("RIFF".data(using: .ascii)!)
+        let fileSizeOffset = wavFH.offsetInFile
+        var placeholder32: UInt32 = 0
+        withUnsafeBytes(of: &placeholder32) { wavFH.write(Data($0)) }
+        wavFH.write("WAVE".data(using: .ascii)!)
 
-        // BEXT chunk — Resolve reads TimeReference for timeline positioning
+        // BEXT chunk
         let bextData = buildBextChunk()
         if !bextData.isEmpty {
-            wav.append("bext".data(using: .ascii)!)
+            wavFH.write("bext".data(using: .ascii)!)
             var bextSize = UInt32(bextData.count).littleEndian
-            withUnsafeBytes(of: &bextSize) { wav.append(contentsOf: $0) }
-            wav.append(bextData)
-            if bextData.count % 2 != 0 { wav.append(UInt8(0)) }
+            withUnsafeBytes(of: &bextSize) { wavFH.write(Data($0)) }
+            wavFH.write(bextData)
+            if bextData.count % 2 != 0 { wavFH.write(Data([UInt8(0)])) }
         }
 
-        // iXML chunk — additional metadata
+        // iXML chunk
         let ixmlData = buildIXMLChunk()
         if !ixmlData.isEmpty {
-            wav.append("iXML".data(using: .ascii)!)
+            wavFH.write("iXML".data(using: .ascii)!)
             var ixmlSize = UInt32(ixmlData.count).littleEndian
-            withUnsafeBytes(of: &ixmlSize) { wav.append(contentsOf: $0) }
-            wav.append(ixmlData)
-            if ixmlData.count % 2 != 0 { wav.append(UInt8(0)) }
+            withUnsafeBytes(of: &ixmlSize) { wavFH.write(Data($0)) }
+            wavFH.write(ixmlData)
+            if ixmlData.count % 2 != 0 { wavFH.write(Data([UInt8(0)])) }
         }
 
         // fmt chunk
-        wav.append("fmt ".data(using: .ascii)!)
-        let fmtSize = UInt32(16).littleEndian
-        withUnsafeBytes(of: fmtSize) { wav.append(contentsOf: $0) }
-        let audioFmt = UInt16(1).littleEndian
-        withUnsafeBytes(of: audioFmt) { wav.append(contentsOf: $0) }
-        withUnsafeBytes(of: numChannels.littleEndian) { wav.append(contentsOf: $0) }
-        withUnsafeBytes(of: sampleRate.littleEndian) { wav.append(contentsOf: $0) }
-        withUnsafeBytes(of: byteRate.littleEndian) { wav.append(contentsOf: $0) }
-        withUnsafeBytes(of: blockAlign.littleEndian) { wav.append(contentsOf: $0) }
-        withUnsafeBytes(of: bitsPerSample.littleEndian) { wav.append(contentsOf: $0) }
+        wavFH.write("fmt ".data(using: .ascii)!)
+        var fmtSize = UInt32(16).littleEndian
+        withUnsafeBytes(of: &fmtSize) { wavFH.write(Data($0)) }
+        var audioFmt = UInt16(1).littleEndian
+        withUnsafeBytes(of: &audioFmt) { wavFH.write(Data($0)) }
+        var channelsLE = numChannels.littleEndian
+        withUnsafeBytes(of: &channelsLE) { wavFH.write(Data($0)) }
+        var rateLE = sampleRate.littleEndian
+        withUnsafeBytes(of: &rateLE) { wavFH.write(Data($0)) }
+        var byteRateLE = byteRate.littleEndian
+        withUnsafeBytes(of: &byteRateLE) { wavFH.write(Data($0)) }
+        var blockAlignLE = blockAlign.littleEndian
+        withUnsafeBytes(of: &blockAlignLE) { wavFH.write(Data($0)) }
+        var bitsLE = bitsPerSample.littleEndian
+        withUnsafeBytes(of: &bitsLE) { wavFH.write(Data($0)) }
 
-        // data chunk
-        wav.append("data".data(using: .ascii)!)
+        // data chunk header (placeholder for size)
+        wavFH.write("data".data(using: .ascii)!)
         var ds = dataSize.littleEndian
-        withUnsafeBytes(of: &ds) { wav.append(contentsOf: $0) }
-        wav.append(audioData)
+        withUnsafeBytes(of: &ds) { wavFH.write(Data($0)) }
 
-        // Update file size
-        let totalSize = UInt32(wav.count - 8).littleEndian
-        wav.replaceSubrange(fileSizePos..<fileSizePos+4, with: withUnsafeBytes(of: totalSize) { Data($0) })
+        // Stream PCM payload from the raw file in 64KB chunks
+        let readFH = try FileHandle(forReadingFrom: pcmURL)
+        defer { try? readFH.close() }
+        let chunkSize = 65536
+        var totalRead: UInt64 = 0
+        while totalRead < pcmFileSize {
+            let remaining = pcmFileSize - totalRead
+            let thisChunk = min(remaining, UInt64(chunkSize))
+            let data = readFH.readData(ofLength: Int(thisChunk))
+            if data.isEmpty { break }
+            wavFH.write(data)
+            totalRead += UInt64(data.count)
+        }
 
-        try wav.write(to: url)
+        // Patch the RIFF file size at the beginning
+        let endOffset = wavFH.offsetInFile
+        var totalSize = UInt32(endOffset - 8).littleEndian
+        try wavFH.seek(toOffset: fileSizeOffset)
+        withUnsafeBytes(of: &totalSize) { wavFH.write(Data($0)) }
     }
 
     private func buildBextChunk() -> Data {

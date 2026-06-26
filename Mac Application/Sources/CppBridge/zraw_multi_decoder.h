@@ -21,8 +21,10 @@ class ThreadSafeQueue {
     mutable std::mutex mutex;
     std::condition_variable cv;
     bool finished = false;
+    size_t max_capacity;
 
 public:
+    explicit ThreadSafeQueue(size_t max_cap = 64) : max_capacity(max_cap) {}
     void push(T item);
     bool pop(T& item);
     void set_finished();

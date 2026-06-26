@@ -8,7 +8,8 @@
 // ================================================================
 template<typename T>
 void ThreadSafeQueue<T>::push(T item) {
-    std::lock_guard<std::mutex> lock(mutex);
+    std::unique_lock<std::mutex> lock(mutex);
+    cv.wait(lock, [this]{ return queue.size() < max_capacity || finished; });
     queue.push(std::move(item));
     cv.notify_all();                    // Wake all workers when new work arrives
 }
@@ -40,6 +41,7 @@ void ThreadSafeQueue<T>::set_finished() {
 // ZrawMultiDecoder Implementation
 // ================================================================
 ZrawMultiDecoder::ZrawMultiDecoder(int num_threads)
+    : frame_queue(num_threads > 0 ? static_cast<size_t>(num_threads) * 4 : 16)
 {
     num_workers = (num_threads > 0) ? num_threads : std::thread::hardware_concurrency();
     if (num_workers < 1) num_workers = 4;

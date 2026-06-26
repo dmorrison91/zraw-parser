@@ -461,60 +461,71 @@ class ViewModel: ObservableObject {
             )
         }
 
-        var audioData = Data()
+        // Stream PCM samples to a temp file instead of accumulating in memory
+        let tempPCM = FileManager.default.temporaryDirectory
+            .appendingPathComponent("\(clipName)_pcm.raw")
+        FileManager.default.createFile(atPath: tempPCM.path, contents: nil, attributes: nil)
+        let pcmFH = try FileHandle(forWritingTo: tempPCM)
+        var totalBytes: UInt64 = 0
+
         while let sampleBuffer = output.copyNextSampleBuffer() {
             if Task.isCancelled { break }
 
-            if let blockBuffer = sampleBuffer.dataBuffer {
-                var ptr: UnsafeMutablePointer<Int8>?
-                var len: Int = 0
-                let status = CMBlockBufferGetDataPointer(
-                    blockBuffer, atOffset: 0,
-                    lengthAtOffsetOut: &len,
-                    totalLengthOut: nil,
-                    dataPointerOut: &ptr
-                )
-                if status == kCMBlockBufferNoErr, let p = ptr, len > 0 {
-                    audioData.append(UnsafeRawPointer(p).assumingMemoryBound(to: UInt8.self), count: len)
-                }
-            } else {
-                var blockBufForList: CMBlockBuffer?
-                var listSize: Int = 0
-                let os = CMSampleBufferGetAudioBufferListWithRetainedBlockBuffer(
-                    sampleBuffer,
-                    bufferListSizeNeededOut: &listSize,
-                    bufferListOut: nil,
-                    bufferListSize: 0,
-                    blockBufferAllocator: nil,
-                    blockBufferMemoryAllocator: nil,
-                    flags: 0,
-                    blockBufferOut: &blockBufForList
-                )
-                if os == noErr, listSize > 0 {
-                    let abl = UnsafeMutablePointer<AudioBufferList>.allocate(capacity: 1)
-                    abl.initialize(to: AudioBufferList(
-                        mNumberBuffers: UInt32(info.audioChannels),
-                        mBuffers: AudioBuffer()
-                    ))
-                    defer { abl.deinitialize(count: 1); abl.deallocate() }
-
-                    let os2 = CMSampleBufferGetAudioBufferListWithRetainedBlockBuffer(
+            autoreleasepool {
+                if let blockBuffer = sampleBuffer.dataBuffer {
+                    var ptr: UnsafeMutablePointer<Int8>?
+                    var len: Int = 0
+                    let status = CMBlockBufferGetDataPointer(
+                        blockBuffer, atOffset: 0,
+                        lengthAtOffsetOut: &len,
+                        totalLengthOut: nil,
+                        dataPointerOut: &ptr
+                    )
+                    if status == kCMBlockBufferNoErr, let p = ptr, len > 0 {
+                        let data = Data(bytes: p, count: len)
+                        pcmFH.write(data)
+                        totalBytes += UInt64(data.count)
+                    }
+                } else {
+                    var blockBufForList: CMBlockBuffer?
+                    var listSize: Int = 0
+                    let os = CMSampleBufferGetAudioBufferListWithRetainedBlockBuffer(
                         sampleBuffer,
-                        bufferListSizeNeededOut: nil,
-                        bufferListOut: abl,
-                        bufferListSize: listSize,
+                        bufferListSizeNeededOut: &listSize,
+                        bufferListOut: nil,
+                        bufferListSize: 0,
                         blockBufferAllocator: nil,
                         blockBufferMemoryAllocator: nil,
                         flags: 0,
                         blockBufferOut: &blockBufForList
                     )
-                    if os2 == noErr {
-                        let bufList = UnsafeMutableAudioBufferListPointer(abl)
-                        for i in 0..<bufList.count {
-                            let buf = bufList[i]
-                            if let data = buf.mData, buf.mDataByteSize > 0 {
-                                audioData.append(data.assumingMemoryBound(to: UInt8.self),
-                                                 count: Int(buf.mDataByteSize))
+                    if os == noErr, listSize > 0 {
+                        let abl = UnsafeMutablePointer<AudioBufferList>.allocate(capacity: 1)
+                        abl.initialize(to: AudioBufferList(
+                            mNumberBuffers: UInt32(info.audioChannels),
+                            mBuffers: AudioBuffer()
+                        ))
+                        defer { abl.deinitialize(count: 1); abl.deallocate() }
+
+                        let os2 = CMSampleBufferGetAudioBufferListWithRetainedBlockBuffer(
+                            sampleBuffer,
+                            bufferListSizeNeededOut: nil,
+                            bufferListOut: abl,
+                            bufferListSize: listSize,
+                            blockBufferAllocator: nil,
+                            blockBufferMemoryAllocator: nil,
+                            flags: 0,
+                            blockBufferOut: &blockBufForList
+                        )
+                        if os2 == noErr {
+                            let bufList = UnsafeMutableAudioBufferListPointer(abl)
+                            for i in 0..<bufList.count {
+                                let buf = bufList[i]
+                                if let data = buf.mData, buf.mDataByteSize > 0 {
+                                    let chunk = Data(bytes: data, count: Int(buf.mDataByteSize))
+                                    pcmFH.write(chunk)
+                                    totalBytes += UInt64(chunk.count)
+                                }
                             }
                         }
                     }
@@ -522,20 +533,25 @@ class ViewModel: ObservableObject {
             }
         }
 
+        try pcmFH.close()
+
         guard reader.status != .failed else {
+            try? FileManager.default.removeItem(at: tempPCM)
             let msg = reader.error?.localizedDescription ?? "unknown error"
             throw ZRAWError.audioExtractionFailed("AVAssetReader failed mid-stream: \(msg)")
         }
 
-        guard !Task.isCancelled else { return }
+        guard !Task.isCancelled else {
+            try? FileManager.default.removeItem(at: tempPCM)
+            return
+        }
 
         let byteRatePerSample = UInt32(info.audioChannels) * UInt32(info.audioSampleSize / 8)
         let videoDuration = Double(info.frameCount) / info.framerate
         let expectedBytes = Int(videoDuration * Double(info.audioSampleRate) * Double(byteRatePerSample))
-        print("[audio] \(clipName): expected ~\(expectedBytes) bytes, got \(audioData.count) bytes")
+        print("[audio] \(clipName): expected ~\(expectedBytes) bytes, got \(totalBytes) bytes")
 
-        // Log WAV timecode — using the video framerate so the logged
-        // TimeReference matches what BEXT actually writes in WAVWriter.
+        // Log WAV timecode
         let tcStr = String(format: "%02d:%02d:%02d:%02d", tcHours, tcMinutes, tcSeconds, tcFrames)
         if hasTimecode {
             let totalSec = Double(tcHours) * 3600.0 + Double(tcMinutes) * 60.0 + Double(tcSeconds) + Double(tcFrames) / info.framerate
@@ -558,7 +574,10 @@ class ViewModel: ObservableObject {
             framerateNumerator: info.framerateNum,
             framerateDenominator: info.framerateDen
         )
-        try writer.write(audioData: audioData, to: wavPath)
+        try writer.writeStreaming(pcmURL: tempPCM, to: wavPath)
+
+        // Clean up temp PCM file
+        try? FileManager.default.removeItem(at: tempPCM)
     }
 }
 
